@@ -30,3 +30,5 @@
 
 ```bash
 curl -sSL [https://raw.githubusercontent.com/Flyerrs/nix-monitor/main/install.sh](https://raw.githubusercontent.com/Flyerrs/nix-monitor/main/install.sh) | sudo bash
+```
+
