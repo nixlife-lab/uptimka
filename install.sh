@@ -212,7 +212,7 @@ if [ -n "$SRC_DIR" ] && [ -f "${SRC_DIR}/uptimka.sh" ] && [ "${BASH_SOURCE[0]:-}
     info "Ставлю uptimka.sh из локальной папки ${SRC_DIR}"
     cp "${SRC_DIR}/uptimka.sh" "$TMP_SCRIPT"
 else
-    if ! curl -fsSL --max-time 30 "${REPO_RAW}/uptimka.sh" -o "$TMP_SCRIPT"; then
+    if ! curl -fsSL --max-time 30 "${REPO_RAW}/uptimka.sh" -o "$TMP_SCRIPT" 2>/dev/null; then
         [ "$UPTIMKA_REF" = "main" ] && die "Не удалось скачать ${REPO_RAW}/uptimka.sh"
         warn "Версия ${UPTIMKA_REF} не найдена, ставлю последнюю из ветки main"
         REPO_RAW="https://raw.githubusercontent.com/nixlife-lab/uptimka/main"
