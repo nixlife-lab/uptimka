@@ -48,7 +48,8 @@ jobs:
             # Последний коммит в main, где uptimka.sh имеет эту версию
             target=""
             for c in $(git rev-list HEAD); do
-              if git show "${c}:uptimka.sh" 2>/dev/null | grep -q "UPTIMKA_VERSION=\"${v}\""; then
+              # без grep -q: ранний выход grep рвёт трубу (SIGPIPE), и с pipefail проверка ложно не проходит
+              if git show "${c}:uptimka.sh" 2>/dev/null | grep "UPTIMKA_VERSION=\"${v}\"" >/dev/null; then
                 target=$c
                 break
               fi
