@@ -35,8 +35,14 @@ jobs:
           for v in $versions; do
             tag="v${v}"
             if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-              echo "✔ ${tag} уже есть"
-              continue
+              if git merge-base --is-ancestor "refs/tags/${tag}^{commit}" HEAD; then
+                echo "✔ ${tag} уже есть"
+                continue
+              fi
+              # Тег указывает на коммит, которого больше нет в main (история переписана) — пересоздаём
+              echo "↻ ${tag} указывает на коммит вне main — пересоздаю релиз"
+              gh release delete "$tag" --yes --cleanup-tag || git push origin ":refs/tags/${tag}" || true
+              git tag -d "$tag"
             fi
 
             # Последний коммит в main, где uptimka.sh имеет эту версию
