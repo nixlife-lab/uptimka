@@ -4,7 +4,7 @@
 
 set -o pipefail
 
-UPTIMKA_VERSION="1.1.0"
+UPTIMKA_VERSION="1.2.0"
 
 # cron запускает задачи с урезанным PATH — добавляем стандартные пути (и snap, где бывает Docker)
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH}"
@@ -39,6 +39,9 @@ ALERT_COOLDOWN=3600
 SEND_RESOLVE_ALERT=true
 NOTIFY_REBOOT=true
 DOCKER_IGNORE=""
+REPORT="off"              # off / hourly / daily / weekly
+REPORT_TIME="09:00"       # во сколько слать daily/weekly (время сервера)
+REPORT_DAY=1              # день недели для weekly: 1 — пн … 7 — вс
 
 if [ -r "$CONFIG_FILE" ]; then
     # shellcheck source=/dev/null
@@ -64,6 +67,22 @@ if ! is_int "$ALERT_COOLDOWN"; then
     ALERT_COOLDOWN=3600
 fi
 [ -z "$DISKS" ] && DISKS="/"
+case "$REPORT" in
+    off|hourly|daily|weekly) ;;
+    *) CONFIG_WARNINGS+=("REPORT=\"${REPORT}\" — нужно off, hourly, daily или weekly; отчёты выключены")
+       REPORT="off" ;;
+esac
+if [[ "$REPORT_TIME" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+    REPORT_HM=$(( 10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]} ))
+    printf -v REPORT_TIME '%02d:%02d' $(( 10#${BASH_REMATCH[1]} )) $(( 10#${BASH_REMATCH[2]} ))
+else
+    CONFIG_WARNINGS+=("REPORT_TIME=\"${REPORT_TIME}\" — нужно ЧЧ:ММ, взято 09:00")
+    REPORT_TIME="09:00"; REPORT_HM=900
+fi
+if ! [[ "$REPORT_DAY" =~ ^[1-7]$ ]]; then
+    CONFIG_WARNINGS+=("REPORT_DAY=\"${REPORT_DAY}\" — нужно 1–7, взят понедельник")
+    REPORT_DAY=1
+fi
 
 # ==========================================================
 # Вспомогательные функции
@@ -300,6 +319,7 @@ render_dashboard() {
         row "🔥 Темп. CPU ${C_GRAY}нет датчика${C_RESET}"
     fi
     row "📈 Нагрузка  ${LOAD1}  ${LOAD5}  ${LOAD15}  ${C_GRAY}(ядер: ${CPU_CORES})${C_RESET}"
+    row "📬 Отчёты    $(report_schedule_text)"
 
     section "📊 Ресурсы"
     row "⚡ CPU   $(draw_bar "$CPU_USAGE" "$CPU_THRESHOLD")  ${C_GRAY}порог ${CPU_THRESHOLD}%${C_RESET}"
@@ -376,41 +396,142 @@ top_processes_html() {
 # ==========================================================
 # 5. Состояние между запусками (/var/lib переживает перезагрузку, в отличие от /run)
 # ==========================================================
-PREV_STATUS="OK"
+PREV_STATUS="OK"          # OK / CRITICAL
 LAST_ALERT_TIME=0
 FIRST_INCIDENT_TIME=0
 LAST_REASONS=""
 BOOT_ID=""
+LAST_REPORT_SLOT=""       # какой период уже покрыт регулярным отчётом
+PERIOD_START=0            # статистика с момента прошлого отчёта
+PERIOD_INCIDENTS=0
+PERIOD_CHECKS=0
+PEAK_CPU=0
+PEAK_RAM=0
+
+STATE_KEYS="PREV_STATUS LAST_ALERT_TIME FIRST_INCIDENT_TIME LAST_REASONS BOOT_ID LAST_REPORT_SLOT PERIOD_START PERIOD_INCIDENTS PERIOD_CHECKS PEAK_CPU PEAK_RAM"
 
 load_state() {
     [ -r "$STATE_FILE" ] || return 0
     # Читаем как «ключ=значение», а не через source — файл не выполняется как код
     local key value
     while IFS='=' read -r key value; do
+        in_list "$key" "$STATE_KEYS" || continue
         case "$key" in
-            PREV_STATUS) PREV_STATUS=$value ;;
-            LAST_ALERT_TIME) is_int "$value" && LAST_ALERT_TIME=$value ;;
-            FIRST_INCIDENT_TIME) is_int "$value" && FIRST_INCIDENT_TIME=$value ;;
-            LAST_REASONS) LAST_REASONS=$value ;;
-            BOOT_ID) BOOT_ID=$value ;;
+            PREV_STATUS|LAST_REASONS|BOOT_ID|LAST_REPORT_SLOT) printf -v "$key" '%s' "$value" ;;
+            *) is_int "$value" && printf -v "$key" '%s' "$value" ;;
         esac
     done < "$STATE_FILE"
 }
 
-save_state() {   # save_state статус время_алерта время_начала ключ_причин
+save_state() {
     mkdir -p "$STATE_DIR"
-    local tmp="${STATE_FILE}.tmp"
-    {
-        echo "PREV_STATUS=$1"
-        echo "LAST_ALERT_TIME=$2"
-        echo "FIRST_INCIDENT_TIME=$3"
-        echo "LAST_REASONS=$4"
-        echo "BOOT_ID=${CURRENT_BOOT_ID}"
-    } > "$tmp" && mv -f "$tmp" "$STATE_FILE"
+    local tmp="${STATE_FILE}.tmp" key
+    for key in $STATE_KEYS; do
+        printf '%s=%s\n' "$key" "${!key}"
+    done > "$tmp" && mv -f "$tmp" "$STATE_FILE"
 }
 
 # ==========================================================
-# 6. Фоновая проверка (cron / systemd timer)
+# 6. Регулярный отчёт (REPORT=hourly / daily / weekly)
+# ==========================================================
+# Возвращает «номер» текущего периода, если время отчёта в нём уже наступило, иначе пусто.
+# Отчёт уходит один раз за период — при первой проверке после REPORT_TIME, поэтому
+# работает при любом интервале проверок и не дублируется.
+report_slot() {
+    local now_hm today_dow
+    now_hm=$(date +%H%M)
+    case "$REPORT" in
+        hourly)
+            date +%Y%m%d%H
+            ;;
+        daily)
+            [ "$now_hm" -ge "$REPORT_HM" ] && date +%Y%m%d
+            ;;
+        weekly)
+            today_dow=$(date +%u)
+            if [ "$today_dow" -gt "$REPORT_DAY" ] || { [ "$today_dow" -eq "$REPORT_DAY" ] && [ "$now_hm" -ge "$REPORT_HM" ]; }; then
+                date +%G-W%V
+            fi
+            ;;
+    esac
+}
+
+build_report() {
+    local host_html period_name="" i mp status_line peaks
+    host_html=$(html_escape "$HOST_NAME")
+    case "$REPORT" in
+        hourly) period_name="За час" ;;
+        daily)  period_name="За сутки" ;;
+        weekly) period_name="За неделю" ;;
+        *)      period_name="С прошлого отчёта" ;;
+    esac
+
+    if [ "$PREV_STATUS" = "CRITICAL" ]; then
+        status_line="🚨 <b>Сейчас есть проблема</b> — подробности в последнем алерте"
+    else
+        status_line="✅ <b>Сейчас всё в норме</b>"
+    fi
+
+    local report
+    report="📊 <b>Отчёт о сервере</b> · $(date '+%d.%m.%Y %H:%M')
+💻 <b>Хост:</b> <code>${host_html}</code>
+⏰ <b>Аптайм:</b> ${UPTIME_STR}
+${status_line}
+
+<b>Сейчас:</b>
+⚡ CPU <code>${CPU_USAGE}%</code> · нагрузка ${LOAD1} / ${LOAD5} / ${LOAD15} (ядер: ${CPU_CORES})
+🧠 RAM <code>${RAM_USAGE}%</code> — ${RAM_USED} из ${RAM_TOTAL} МБ"
+    [ "$SWAP_TOTAL" -gt 0 ] && report+="
+🔁 Swap ${SWAP_USED} из ${SWAP_TOTAL} МБ"
+    for i in "${!DISK_MOUNTS[@]}"; do
+        mp=${DISK_MOUNTS[$i]}
+        report+="
+💾 Диск $(html_escape "$mp") <code>${DISK_USAGES[$i]}%</code> — свободно ${DISK_FREES[$i]} из ${DISK_SIZES[$i]}"
+    done
+    [ -n "$CPU_TEMP" ] && report+="
+🔥 Температура CPU ${CPU_TEMP}°C"
+    if [ "$DOCKER_AVAILABLE" = true ]; then
+        if [ "${#DOCKER_PROBLEMS[@]}" -eq 0 ]; then
+            report+="
+🐳 Docker: работает ${DOCKER_RUNNING} из ${DOCKER_TOTAL}, проблем нет"
+        else
+            report+="
+🐳 Docker: работает ${DOCKER_RUNNING} из ${DOCKER_TOTAL}, проблемных: ${#DOCKER_PROBLEMS[@]}"
+        fi
+    fi
+
+    if [ "$PERIOD_CHECKS" -gt 0 ]; then
+        peaks="⚡ CPU до <code>${PEAK_CPU}%</code> · 🧠 RAM до <code>${PEAK_RAM}%</code>"
+        report+="
+
+<b>${period_name}:</b>
+📈 Пики по замерам: ${peaks}"
+        if [ "$PERIOD_INCIDENTS" -eq 0 ]; then
+            report+="
+🟢 Без происшествий"
+        else
+            report+="
+🟠 Проблем: ${PERIOD_INCIDENTS}"
+        fi
+    fi
+
+    report+="
+
+🏆 <b>Топ процессов по памяти:</b>
+$(top_processes_html)"
+    printf '%s' "$report"
+}
+
+reset_period() {
+    PERIOD_START=$CURRENT_TIME
+    PERIOD_INCIDENTS=0
+    PERIOD_CHECKS=0
+    PEAK_CPU=0
+    PEAK_RAM=0
+}
+
+# ==========================================================
+# 7. Фоновая проверка (cron / systemd timer)
 # ==========================================================
 run_check() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -426,19 +547,28 @@ run_check() {
     fi
 
     collect_metrics
+    local first_run=false
+    [ -f "$STATE_FILE" ] || first_run=true
     load_state
-    CURRENT_BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+    [ "$PERIOD_START" -eq 0 ] && reset_period
 
-    local host_html
+    local host_html current_boot
     host_html=$(html_escape "$HOST_NAME")
+    current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 
     # --- Перезагрузка
-    if [ "$NOTIFY_REBOOT" = true ] && [ -n "$BOOT_ID" ] && [ "$BOOT_ID" != "$CURRENT_BOOT_ID" ]; then
+    if [ "$NOTIFY_REBOOT" = true ] && [ -n "$BOOT_ID" ] && [ "$BOOT_ID" != "$current_boot" ]; then
         local rmsg="🔄 <b>Сервер перезагрузился</b>
 💻 <b>Хост:</b> <code>${host_html}</code>
 ⏰ <b>Работает:</b> ${UPTIME_STR}"
         send_telegram "$rmsg" || true
     fi
+    BOOT_ID=$current_boot
+
+    # --- Статистика для регулярного отчёта
+    PERIOD_CHECKS=$(( PERIOD_CHECKS + 1 ))
+    [ "$CPU_USAGE" -gt "$PEAK_CPU" ] && PEAK_CPU=$CPU_USAGE
+    [ "$RAM_USAGE" -gt "$PEAK_RAM" ] && PEAK_RAM=$RAM_USAGE
 
     # --- Причины тревоги (ключ — для отслеживания смены ситуации, текст — для сообщения)
     local keys=() lines=() i mp p name
@@ -492,10 +622,12 @@ $(top_processes_html)"
 
             # Не дошло — статус не меняем, на следующем запуске попробуем снова
             if send_telegram "$msg"; then
-                save_state "CRITICAL" "$CURRENT_TIME" "$first" "$reasons_key"
+                [ "$PREV_STATUS" != "CRITICAL" ] && PERIOD_INCIDENTS=$(( PERIOD_INCIDENTS + 1 ))
+                PREV_STATUS="CRITICAL"
+                LAST_ALERT_TIME=$CURRENT_TIME
+                FIRST_INCIDENT_TIME=$first
+                LAST_REASONS=$reasons_key
             fi
-        elif [ "$BOOT_ID" != "$CURRENT_BOOT_ID" ]; then
-            save_state "$PREV_STATUS" "$LAST_ALERT_TIME" "$FIRST_INCIDENT_TIME" "$LAST_REASONS"
         fi
 
     elif [ "$PREV_STATUS" = "CRITICAL" ]; then
@@ -519,16 +651,32 @@ $(top_processes_html)"
             fi
             send_telegram "$msg" || sent=false
         fi
-        # Если отчёт не ушёл — оставляем CRITICAL, чтобы отправить его на следующем запуске
-        [ "$sent" = true ] && save_state "OK" 0 0 ""
-
-    elif [ "$BOOT_ID" != "$CURRENT_BOOT_ID" ] || [ ! -f "$STATE_FILE" ]; then
-        save_state "OK" 0 0 ""
+        # Если сообщение не ушло — оставляем CRITICAL, чтобы отправить его на следующем запуске
+        if [ "$sent" = true ]; then
+            PREV_STATUS="OK"; LAST_ALERT_TIME=0; FIRST_INCIDENT_TIME=0; LAST_REASONS=""
+        fi
     fi
+
+    # --- Регулярный отчёт
+    if [ "$REPORT" != "off" ]; then
+        local slot
+        slot=$(report_slot)
+        if [ -n "$slot" ] && [ "$slot" != "$LAST_REPORT_SLOT" ]; then
+            if [ "$first_run" = true ] || [ -z "$LAST_REPORT_SLOT" ]; then
+                # Только что установили (или включили отчёты) — первый отчёт будет в следующем периоде
+                LAST_REPORT_SLOT=$slot
+            elif send_telegram "$(build_report)"; then
+                LAST_REPORT_SLOT=$slot
+                reset_period
+            fi
+        fi
+    fi
+
+    save_state
 }
 
 # ==========================================================
-# 7. Прочие команды
+# 8. Прочие команды
 # ==========================================================
 show_help() {
     cat <<EOF
@@ -540,6 +688,7 @@ show_help() {
   -w, --watch        живой дашборд, обновление каждые 2 секунды (выход — Ctrl+C)
   --cron             фоновая проверка и алерты (для cron/systemd)
   --test             отправить тестовое сообщение в Telegram
+  --report           отправить отчёт о состоянии сервера прямо сейчас
   --uninstall        удалить uptimka с сервера
   -v, --version      показать версию
   -h, --help         эта справка
@@ -563,6 +712,27 @@ send_test() {
         echo "❌ Не удалось отправить — проверьте BOT_TOKEN и CHAT_ID в ${CONFIG_FILE}"
         exit 1
     fi
+}
+
+send_report_now() {
+    collect_metrics
+    [ -r "$STATE_FILE" ] && load_state
+    if send_telegram "$(build_report)"; then
+        echo "✅ Отчёт отправлен"
+    else
+        echo "❌ Не удалось отправить — проверьте BOT_TOKEN и CHAT_ID в ${CONFIG_FILE}"
+        exit 1
+    fi
+}
+
+report_schedule_text() {
+    local days=(пн вт ср чт пт сб вс)
+    case "$REPORT" in
+        hourly) printf 'каждый час' ;;
+        daily)  printf 'каждый день в %s' "$REPORT_TIME" ;;
+        weekly) printf 'по %s в %s' "${days[$((REPORT_DAY - 1))]}" "$REPORT_TIME" ;;
+        *)      printf 'выключены' ;;
+    esac
 }
 
 uninstall() {
@@ -611,6 +781,7 @@ case "${1:-}" in
     -w|--watch)     watch_mode ;;
     --cron)         run_check ;;
     --test)         send_test ;;
+    --report)       send_report_now ;;
     --uninstall)    uninstall ;;
     "")
         if [ -t 1 ]; then

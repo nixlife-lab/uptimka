@@ -5,7 +5,7 @@
 
 set -eo pipefail
 
-UPTIMKA_REF="${UPTIMKA_REF:-v1.1.0}"   # какую версию ставить (тег релиза; UPTIMKA_REF=main — самая свежая)
+UPTIMKA_REF="${UPTIMKA_REF:-v1.2.0}"   # какую версию ставить (тег релиза; UPTIMKA_REF=main — самая свежая)
 REPO_RAW="https://raw.githubusercontent.com/nixlife-lab/uptimka/${UPTIMKA_REF}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/uptimka"
@@ -143,6 +143,28 @@ fi
 
 ask_number "Интервал проверки, минут" 5 1 59; USER_INTERVAL=$REPLY
 
+# Регулярный отчёт о состоянии сервера (алерты о проблемах приходят независимо от него)
+echo ""
+echo "📊 Регулярный отчёт о состоянии сервера в Telegram:"
+echo "   0 — не присылать   1 — каждый час   2 — каждый день   3 — раз в неделю"
+ask_number "Ваш выбор" 2 0 3
+USER_REPORT_TIME="09:00"; USER_REPORT_DAY=1
+case "$REPLY" in
+    0) USER_REPORT="off" ;;
+    1) USER_REPORT="hourly" ;;
+    2) USER_REPORT="daily" ;;
+    3) USER_REPORT="weekly"
+       ask_number "День недели (1 — пн … 7 — вс)" 1 1 7; USER_REPORT_DAY=$REPLY ;;
+esac
+if [ "$USER_REPORT" = "daily" ] || [ "$USER_REPORT" = "weekly" ]; then
+    while true; do
+        ask "Во сколько присылать (ЧЧ:ММ, время сервера — сейчас $(date +%H:%M))" "09:00"
+        [[ "$REPLY" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] && break
+        warn "Время в формате ЧЧ:ММ, например 09:00"
+    done
+    USER_REPORT_TIME=$REPLY
+fi
+
 # ==========================================================
 # Проверка Telegram
 # ==========================================================
@@ -199,6 +221,21 @@ NOTIFY_REBOOT=true
 DOCKER_IGNORE=""
 EOF
 fi
+
+# Настройки отчёта: заменяем строки в конфиге, а если их нет (старый конфиг) — дописываем
+set_conf() {   # set_conf КЛЮЧ значение
+    if grep -q "^${1}=" "$CONFIG_FILE"; then
+        sed -i "s|^${1}=.*|${1}=${2}|" "$CONFIG_FILE"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$CONFIG_FILE"
+    fi
+}
+if ! grep -q '^REPORT=' "$CONFIG_FILE"; then
+    printf '\n# Регулярный отчёт: off / hourly / daily / weekly; время — по часам сервера; день: 1 — пн … 7 — вс\n' >> "$CONFIG_FILE"
+fi
+set_conf REPORT "\"${USER_REPORT}\""
+set_conf REPORT_TIME "\"${USER_REPORT_TIME}\""
+set_conf REPORT_DAY "${USER_REPORT_DAY}"
 chmod 600 "$CONFIG_FILE"
 
 # ==========================================================
