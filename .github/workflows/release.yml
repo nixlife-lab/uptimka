@@ -1,0 +1,81 @@
+# Автоматические релизы: для каждой версии из раздела «Что нового» в README,
+# у которой ещё нет тега, создаёт тег vX.Y.Z и релиз на последнем коммите этой версии.
+# Чтобы выпустить новую версию, достаточно поднять UPTIMKA_VERSION в uptimka.sh
+# и добавить её описание в README — релиз появится сам после пуша в main.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create missing releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          # Версии из README: строки вида **1.2.0** в разделе «Что нового», от старых к новым
+          versions=$(grep -oE '^\*\*[0-9]+\.[0-9]+\.[0-9]+\*\*$' README.md | tr -d '*' | sort -V)
+
+          latest=$(grep -oE 'UPTIMKA_VERSION="[0-9.]+"' uptimka.sh | cut -d'"' -f2)
+
+          for v in $versions; do
+            tag="v${v}"
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              echo "✔ ${tag} уже есть"
+              continue
+            fi
+
+            # Последний коммит в main, где uptimka.sh имеет эту версию
+            target=""
+            for c in $(git rev-list HEAD); do
+              if git show "${c}:uptimka.sh" 2>/dev/null | grep -q "UPTIMKA_VERSION=\"${v}\""; then
+                target=$c
+                break
+              fi
+            done
+            if [ -z "$target" ]; then
+              echo "⚠ Для ${v} нет коммита с такой версией в uptimka.sh — пропускаю"
+              continue
+            fi
+
+            # Описание — блок этой версии из README
+            awk -v v="**${v}**" '
+              $0 == v {on=1; next}
+              on && (/^\*\*[0-9]+\.[0-9]+\.[0-9]+\*\*$/ || /^---/ || /^## /) {exit}
+              on {print}
+            ' README.md > notes.md
+            {
+              echo ""
+              echo "### 🚀 Установка / обновление"
+              echo '```bash'
+              echo "curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh | sudo UPTIMKA_REF=${tag} bash"
+              echo '```'
+            } >> notes.md
+
+            latest_flag="--latest=false"
+            [ "$v" = "$latest" ] && latest_flag="--latest"
+
+            # Файлы релиза — из коммита этой версии, а не из текущего main
+            rm -rf dist && mkdir dist
+            for f in uptimka.sh install.sh uptimka.conf; do
+              git show "${target}:${f}" > "dist/${f}"
+            done
+
+            gh release create "$tag" --target "$target" --title "uptimka ${v}" \
+              --notes-file notes.md "$latest_flag" dist/uptimka.sh dist/install.sh dist/uptimka.conf
+            echo "🎉 Создан релиз ${tag} (${target:0:7})"
+          done
