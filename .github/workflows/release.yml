@@ -16,7 +16,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -42,7 +42,7 @@ jobs:
               # Тег указывает на коммит, которого больше нет в main (история переписана) — пересоздаём
               echo "↻ ${tag} указывает на коммит вне main — пересоздаю релиз"
               gh release delete "$tag" --yes --cleanup-tag || git push origin ":refs/tags/${tag}" || true
-              git tag -d "$tag"
+              git tag -d "$tag" 2>/dev/null || true
             fi
 
             # Последний коммит в main, где uptimka.sh имеет эту версию
