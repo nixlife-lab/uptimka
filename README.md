@@ -153,6 +153,12 @@
 curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh | sudo bash
 ```
 
+Если вы уже под root (например, на хосте Proxmox, где `sudo` нет) — без `sudo`:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh | bash
+```
+
 Установщик:
 1. спросит `Bot Token` (ввод скрыт) и `Chat ID` и проверит их формат;
 2. предложит пороги, список дисков, интервал проверки и как часто присылать отчёт;
