@@ -5,7 +5,7 @@
 
 set -eo pipefail
 
-UPTIMKA_REF="${UPTIMKA_REF:-v1.2.0}"   # какую версию ставить (тег релиза; UPTIMKA_REF=main — самая свежая)
+UPTIMKA_REF="${UPTIMKA_REF:-v1.3.0}"   # какую версию ставить (тег релиза; UPTIMKA_REF=main — самая свежая)
 REPO_RAW="https://raw.githubusercontent.com/nixlife-lab/uptimka/${UPTIMKA_REF}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/uptimka"
@@ -165,6 +165,24 @@ if [ "$USER_REPORT" = "daily" ] || [ "$USER_REPORT" = "weekly" ]; then
     USER_REPORT_TIME=$REPLY
 fi
 
+# Proxmox VE — спрашиваем, только если установщик запущен на хосте Proxmox
+USER_PROXMOX=""
+if command -v pvesh >/dev/null 2>&1 && [ -d /etc/pve ]; then
+    echo ""
+    echo "🖥 Это хост Proxmox VE. Гости на этом сервере:"
+    if command -v qm >/dev/null 2>&1; then qm list 2>/dev/null | awk 'NR>1 {printf "   VM  %-5s %s (%s)\n", $1, $2, $3}'; fi
+    if command -v pct >/dev/null 2>&1; then pct list 2>/dev/null | awk 'NR>1 {printf "   LXC %-5s %s (%s)\n", $1, $NF, $2}'; fi
+    if ask_yes "Следить за виртуалками, контейнерами, хранилищами и бэкапами?"; then
+        USER_PROXMOX="auto"
+        ask "Какие ID проверять (через пробел; Enter — все)" ""
+        USER_PVE_GUESTS=$REPLY
+        ask_number "Предупреждать, если последнему бэкапу больше N дней (0 — не следить)" 0 0 365
+        USER_BACKUP_DAYS=$REPLY
+    else
+        USER_PROXMOX="off"
+    fi
+fi
+
 # ==========================================================
 # Проверка Telegram
 # ==========================================================
@@ -236,6 +254,16 @@ fi
 set_conf REPORT "\"${USER_REPORT}\""
 set_conf REPORT_TIME "\"${USER_REPORT_TIME}\""
 set_conf REPORT_DAY "${USER_REPORT_DAY}"
+if [ -n "$USER_PROXMOX" ]; then
+    if ! grep -q '^PROXMOX=' "$CONFIG_FILE"; then
+        printf '\n# Proxmox VE: auto / off; гости — ID через пробел (пусто — все); давность бэкапа в днях (0 — не следить)\n' >> "$CONFIG_FILE"
+    fi
+    set_conf PROXMOX "\"${USER_PROXMOX}\""
+    if [ "$USER_PROXMOX" = "auto" ]; then
+        set_conf PROXMOX_GUESTS "\"${USER_PVE_GUESTS}\""
+        set_conf BACKUP_MAX_AGE_DAYS "${USER_BACKUP_DAYS}"
+    fi
+fi
 chmod 600 "$CONFIG_FILE"
 
 # ==========================================================

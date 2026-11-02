@@ -4,7 +4,7 @@
 
 set -o pipefail
 
-UPTIMKA_VERSION="1.2.0"
+UPTIMKA_VERSION="1.3.0"
 
 # cron запускает задачи с урезанным PATH — добавляем стандартные пути (и snap, где бывает Docker)
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH}"
@@ -42,6 +42,17 @@ DOCKER_IGNORE=""
 REPORT="off"              # off / hourly / daily / weekly
 REPORT_TIME="09:00"       # во сколько слать daily/weekly (время сервера)
 REPORT_DAY=1              # день недели для weekly: 1 — пн … 7 — вс
+DOCKER="auto"             # auto / off
+PROXMOX="auto"            # auto / off
+PROXMOX_GUESTS=""         # пусто — все VM/LXC, иначе ID через пробел
+PROXMOX_IGNORE=""
+GUEST_RAM_THRESHOLD=95
+STORAGE_THRESHOLD=90
+STORAGE_IGNORE=""
+BACKUP_MAX_AGE_DAYS=0     # 0 — не следить за давностью бэкапов
+SMART="auto"              # auto / off
+SSD_WEAR_THRESHOLD=80
+PVE_ETC="${UPTIMKA_PVE_ETC:-/etc/pve}"
 
 if [ -r "$CONFIG_FILE" ]; then
     # shellcheck source=/dev/null
@@ -62,6 +73,13 @@ check_pct() {   # check_pct ИМЯ_ПЕРЕМЕННОЙ значение_по_у
 check_pct CPU_THRESHOLD 85
 check_pct RAM_THRESHOLD 90
 check_pct DISK_THRESHOLD 90
+check_pct GUEST_RAM_THRESHOLD 95
+check_pct STORAGE_THRESHOLD 90
+check_pct SSD_WEAR_THRESHOLD 80
+if ! is_int "$BACKUP_MAX_AGE_DAYS"; then
+    CONFIG_WARNINGS+=("BACKUP_MAX_AGE_DAYS=\"${BACKUP_MAX_AGE_DAYS}\" — не число, проверка давности бэкапов выключена")
+    BACKUP_MAX_AGE_DAYS=0
+fi
 if ! is_int "$ALERT_COOLDOWN"; then
     CONFIG_WARNINGS+=("ALERT_COOLDOWN=\"${ALERT_COOLDOWN}\" — не число, взято 3600")
     ALERT_COOLDOWN=3600
@@ -208,6 +226,16 @@ collect_metrics() {
     fi
 
     collect_docker
+
+    EXTRA_KEYS=(); EXTRA_TEXT=(); EXTRA_HTML=()
+    if [ "$DOCKER_DOWN" = true ]; then
+        add_problem "docker:daemon" "🐳 Docker установлен, но не отвечает" \
+            "🐳 <b>Docker не отвечает</b> — служба остановлена или зависла (<code>systemctl status docker</code>)"
+    fi
+    collect_proxmox
+    check_proxmox
+    collect_smart
+    check_smart
 }
 
 # ==========================================================
@@ -219,8 +247,14 @@ collect_docker() {
     DOCKER_RUNNING=0
     DOCKER_TOTAL=0
 
+    DOCKER_DOWN=false
+    [ "$DOCKER" = "off" ] && return 0
     command -v docker >/dev/null 2>&1 || return 0
-    docker info >/dev/null 2>&1 || return 0
+    if ! docker info >/dev/null 2>&1; then
+        # Без root docker info падает из-за прав — это не поломка
+        [ "$(id -u)" -eq 0 ] && DOCKER_DOWN=true
+        return 0
+    fi
     DOCKER_AVAILABLE=true
 
     local ids
@@ -263,6 +297,232 @@ collect_docker() {
 }
 
 # ==========================================================
+# 2b. Proxmox VE: гости (VM/LXC), хранилища, бэкапы
+# ==========================================================
+# Общие «дополнительные проблемы» (Proxmox, SSD): ключ для отслеживания, текст для дашборда и HTML для Telegram
+EXTRA_KEYS=(); EXTRA_TEXT=(); EXTRA_HTML=()
+add_problem() {   # add_problem ключ "текст" "html"
+    EXTRA_KEYS+=("$1"); EXTRA_TEXT+=("$2"); EXTRA_HTML+=("$3")
+}
+
+human_bytes() {   # 296789571796 → «276 ГБ» (до 10 — с десятыми)
+    awk -v b="$1" 'BEGIN {
+        split("Б КБ МБ ГБ ТБ", u, " "); i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        if (b < 10 && i > 1) printf "%.1f %s", b, u[i]; else printf "%d %s", b + 0.5, u[i]
+    }'
+}
+
+PVE_PARSER='
+import json, sys
+node = sys.argv[1]
+data = json.load(open(sys.argv[2]))
+nodes = [r.get("node") for r in data if r.get("type") == "node"]
+if node not in nodes and len(nodes) == 1:
+    node = nodes[0]
+for r in data:
+    if r.get("node") != node:
+        continue
+    t = r.get("type")
+    if t in ("qemu", "lxc") and not r.get("template"):
+        print("G|%s|%s|%s|%s|%d|%d|%d|%d|%d" % (r.get("vmid"), t, (r.get("name") or "").replace("|", "/"),
+              r.get("status", "?"), round(float(r.get("cpu") or 0) * 100), int(r.get("mem") or 0),
+              int(r.get("maxmem") or 0), int(r.get("disk") or 0), int(r.get("maxdisk") or 0)))
+    elif t == "storage":
+        print("S|%s|%s|%s|%d|%d" % (r.get("storage"), r.get("plugintype", "?"), r.get("status", "?"),
+              int(r.get("disk") or 0), int(r.get("maxdisk") or 0)))
+'
+
+PVE_TASKS_PARSER='
+import json, sys
+seen = set()
+for t in sorted(json.load(open(sys.argv[1])), key=lambda x: -int(x.get("starttime") or 0)):
+    vid = str(t.get("id") or "")
+    if not vid or vid in seen:
+        continue
+    seen.add(vid)
+    print("B|%s|%d|%s" % (vid, int(t.get("endtime") or t.get("starttime") or 0), (t.get("status") or "?").replace("|", "/")))
+'
+
+PVE_AVAILABLE=false
+PVE_NOTE=""
+PVE_LAST=0
+collect_proxmox() {
+    [ "$PROXMOX" = "off" ] && return 0
+    command -v pvesh >/dev/null 2>&1 && [ -d "$PVE_ETC" ] || return 0
+
+    # В живом режиме дашборда опрашиваем Proxmox не чаще раза в 10 секунд — pvesh небыстрый
+    [ "$PVE_AVAILABLE" = true ] && [ $(( CURRENT_TIME - PVE_LAST )) -lt 10 ] && return 0
+
+    PVE_GUESTS=(); PVE_STORAGES=(); PVE_BACKUPS=()
+    PVE_AVAILABLE=false
+    if [ "$(id -u)" -ne 0 ]; then PVE_NOTE="нужен root — запустите через sudo"; return 0; fi
+    if ! command -v python3 >/dev/null 2>&1; then PVE_NOTE="нужен python3 (apt install python3)"; return 0; fi
+
+    local tmp node line
+    tmp=$(mktemp)
+    node=$(hostname -s 2>/dev/null || hostname)
+    if ! pvesh get /cluster/resources --output-format json > "$tmp" 2>/dev/null; then
+        PVE_NOTE="pvesh не ответил"; rm -f "$tmp"; return 0
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            G\|*) PVE_GUESTS+=("${line#G|}") ;;
+            S\|*) PVE_STORAGES+=("${line#S|}") ;;
+        esac
+    done < <(python3 -c "$PVE_PARSER" "$node" "$tmp" 2>/dev/null)
+
+    if pvesh get "/nodes/${node}/tasks" --typefilter vzdump --limit 200 --output-format json > "$tmp" 2>/dev/null; then
+        while IFS= read -r line; do
+            PVE_BACKUPS+=("${line#B|}")
+        done < <(python3 -c "$PVE_TASKS_PARSER" "$tmp" 2>/dev/null)
+    fi
+    rm -f "$tmp"
+
+    PVE_AVAILABLE=true; PVE_NOTE=""; PVE_LAST=$CURRENT_TIME
+}
+
+pve_selected() {   # pve_selected vmid → проверять ли гостя
+    in_list "$1" "$PROXMOX_IGNORE" && return 1
+    [ -z "$PROXMOX_GUESTS" ] && return 0
+    in_list "$1" "$PROXMOX_GUESTS"
+}
+
+pve_onboot() {     # pve_onboot vmid тип → включён ли автозапуск
+    local f
+    if [ "$2" = "lxc" ]; then f="${PVE_ETC}/lxc/$1.conf"; else f="${PVE_ETC}/qemu-server/$1.conf"; fi
+    [ -r "$f" ] && sed '/^\[/q' "$f" | grep -q '^onboot: *1'
+}
+
+pve_backup_of() {  # pve_backup_of vmid → «время|статус» последнего бэкапа или пусто
+    local b
+    for b in "${PVE_BACKUPS[@]}"; do
+        [ "${b%%|*}" = "$1" ] && { printf '%s' "${b#*|}"; return 0; }
+    done
+    return 1
+}
+
+pve_kind() { [ "$1" = "lxc" ] && printf 'LXC' || printf 'VM'; }
+
+check_proxmox() {
+    [ "$PVE_AVAILABLE" = true ] || return 0
+    local g vmid type name status cpu mem maxmem disk maxdisk pct label label_html b bt bs age s sname sstatus sused smax
+    for g in "${PVE_GUESTS[@]}"; do
+        IFS='|' read -r vmid type name status cpu mem maxmem disk maxdisk <<< "$g"
+        pve_selected "$vmid" || continue
+        label="$(pve_kind "$type") ${vmid} ${name}"
+        label_html="<b>$(pve_kind "$type") ${vmid}</b> <code>$(html_escape "$name")</code>"
+
+        if [ "$status" != "running" ]; then
+            if pve_onboot "$vmid" "$type"; then
+                add_problem "pve:down:${vmid}" "🖥 ${label} — ${status}, хотя включён автозапуск" \
+                    "🖥 ${label_html} — <b>${status}</b>, хотя включён автозапуск"
+            fi
+        else
+            if [ "$maxmem" -gt 0 ]; then
+                pct=$(( mem * 100 / maxmem ))
+                [ "$pct" -ge "$GUEST_RAM_THRESHOLD" ] && add_problem "pve:ram:${vmid}" \
+                    "🖥 ${label} — RAM ${pct}% ($(human_bytes "$mem") из $(human_bytes "$maxmem"))" \
+                    "🖥 ${label_html} — RAM <code>${pct}%</code> ($(human_bytes "$mem") из $(human_bytes "$maxmem"))"
+            fi
+            if [ "$type" = "lxc" ] && [ "$maxdisk" -gt 0 ] && [ "$disk" -gt 0 ]; then
+                pct=$(( disk * 100 / maxdisk ))
+                [ "$pct" -ge "$DISK_THRESHOLD" ] && add_problem "pve:disk:${vmid}" \
+                    "🖥 ${label} — диск ${pct}% ($(human_bytes "$disk") из $(human_bytes "$maxdisk"))" \
+                    "🖥 ${label_html} — диск <code>${pct}%</code> ($(human_bytes "$disk") из $(human_bytes "$maxdisk"))"
+            fi
+        fi
+
+        if b=$(pve_backup_of "$vmid"); then
+            bt=${b%%|*}; bs=${b#*|}
+            case "$bs" in
+                OK|WARNINGS*) ;;
+                *) add_problem "pve:backup-failed:${vmid}" "🗃 ${label} — бэкап с ошибкой: ${bs}" \
+                       "🗃 ${label_html} — последний бэкап с ошибкой: <code>$(html_escape "$bs")</code>" ;;
+            esac
+            age=$(( (CURRENT_TIME - bt) / 86400 ))
+            if [ "$BACKUP_MAX_AGE_DAYS" -gt 0 ] && [ "$age" -ge "$BACKUP_MAX_AGE_DAYS" ]; then
+                add_problem "pve:backup-old:${vmid}" "🗃 ${label} — последний бэкап ${age} дн. назад" \
+                    "🗃 ${label_html} — последний бэкап был <b>${age} дн. назад</b> (лимит ${BACKUP_MAX_AGE_DAYS})"
+            fi
+        fi
+    done
+
+    for s in "${PVE_STORAGES[@]}"; do
+        IFS='|' read -r sname _ sstatus sused smax <<< "$s"
+        in_list "$sname" "$STORAGE_IGNORE" && continue
+        if [ "$sstatus" != "available" ]; then
+            add_problem "pve:storage-down:${sname}" "🗄 Хранилище ${sname} недоступно" \
+                "🗄 Хранилище <code>$(html_escape "$sname")</code> <b>недоступно</b>"
+        elif [ "$smax" -gt 0 ]; then
+            pct=$(( sused * 100 / smax ))
+            [ "$pct" -ge "$STORAGE_THRESHOLD" ] && add_problem "pve:storage:${sname}" \
+                "🗄 Хранилище ${sname} заполнено на ${pct}%" \
+                "🗄 Хранилище <code>$(html_escape "$sname")</code> заполнено на <code>${pct}%</code> — свободно $(human_bytes $(( smax - sused )))"
+        fi
+    done
+}
+
+# ==========================================================
+# 2c. Здоровье SSD/NVMe через smartctl
+# ==========================================================
+SMART_DISKS=()   # «устройство|модель|здоровье|износ%|записано|температура»
+SMART_LAST=0
+collect_smart() {
+    [ "$SMART" = "off" ] && return 0
+    command -v smartctl >/dev/null 2>&1 || return 0
+    [ "$(id -u)" -eq 0 ] || return 0
+    # SMART меняется медленно — в живом режиме читаем раз в минуту
+    [ "${#SMART_DISKS[@]}" -gt 0 ] && [ $(( CURRENT_TIME - SMART_LAST )) -lt 60 ] && return 0
+    SMART_DISKS=(); SMART_LAST=$CURRENT_TIME
+
+    local dev opt out
+    while read -r dev opt _; do
+        [ -n "$dev" ] || continue
+        out=$(LC_ALL=C smartctl -H -A -i -d "$opt" "$dev" 2>/dev/null) || [ -n "$out" ] || continue
+        SMART_DISKS+=("$(awk -v dev="${dev#/dev/}" '
+            /^(Model Number|Device Model):/        { sub(/^[^:]*: */, ""); model = $0 }
+            /overall-health self-assessment/        { health = $NF }
+            /^SMART Health Status:/                 { health = $NF }
+            /^Critical Warning:/                    { if ($NF != "0x00") health = "WARNING" }
+            /^Percentage Used:/                     { gsub(/%/, "", $NF); wear = $NF }
+            /^Data Units Written:/                  { if (match($0, /\[[^]]*\]/)) written = substr($0, RSTART + 1, RLENGTH - 2) }
+            /^Temperature:/                         { temp = $2 }
+            /Temperature_Celsius/ && temp == ""     { temp = $10 }
+            END { printf "%s|%s|%s|%s|%s|%s", dev, model, health, wear, written, temp }
+        ' <<< "$out")")
+    done < <(smartctl --scan 2>/dev/null | awk '{print $1, $3}')
+}
+
+check_smart() {
+    local d dev model health wear written temp
+    for d in "${SMART_DISKS[@]}"; do
+        IFS='|' read -r dev model health wear written temp <<< "$d"
+        case "$health" in
+            PASSED|OK|"") ;;
+            *) add_problem "smart:health:${dev}" "🩺 Диск ${dev} — SMART: ${health}" \
+                   "🩺 <b>Диск ${dev}</b> ($(html_escape "$model")) — SMART: <b>${health}</b>. Пора сделать бэкап и подумать о замене" ;;
+        esac
+        if [ -n "$wear" ] && is_int "$wear" && [ "$wear" -ge "$SSD_WEAR_THRESHOLD" ]; then
+            add_problem "smart:wear:${dev}" "🩺 Диск ${dev} — износ ${wear}%" \
+                "🩺 <b>Диск ${dev}</b> ($(html_escape "$model")) — износ <code>${wear}%</code> ресурса"
+        fi
+    done
+}
+
+smart_line() {     # человекочитаемая строка о диске
+    local dev model health wear written temp out
+    IFS='|' read -r dev model health wear written temp <<< "$1"
+    out="${dev}"
+    [ -n "$model" ] && out+=" (${model})"
+    [ -n "$wear" ] && out+=" · износ ${wear}%"
+    [ -n "$written" ] && out+=" · записано ${written}"
+    [ -n "$temp" ] && out+=" · ${temp}°C"
+    case "$health" in PASSED|OK) out+=" · ✅ здоров" ;; "") ;; *) out+=" · ❗ ${health}" ;; esac
+    printf '%s' "$out"
+}
+
+# ==========================================================
 # 3. TUI-дашборд (без правой рамки — ширину эмодзи терминалы считают по-разному)
 # ==========================================================
 level_color() {   # level_color значение порог → зелёный / жёлтый (≥80% порога) / красный
@@ -287,6 +547,64 @@ LINE="${C_BLUE}│${C_RESET}"
 section() { printf '%s\n' "${C_BLUE}├─${C_RESET} ${C_BOLD}$1${C_RESET}"; }
 row()     { printf '%s %s\n' "$LINE" "$1"; }
 
+render_proxmox() {
+    [ "$PROXMOX" = "off" ] && return 0
+    if [ "$PVE_AVAILABLE" != true ]; then
+        [ -n "$PVE_NOTE" ] && { section "🖥 Proxmox"; row "${C_YELLOW}${PVE_NOTE}${C_RESET}"; }
+        return 0
+    fi
+    section "🖥 Proxmox"
+    local g vmid type name status cpu mem maxmem disk maxdisk icon extra shown=0
+    for g in "${PVE_GUESTS[@]}"; do
+        IFS='|' read -r vmid type name status cpu mem maxmem disk maxdisk <<< "$g"
+        pve_selected "$vmid" || continue
+        shown=$(( shown + 1 ))
+        if [ "$status" = "running" ]; then
+            icon="🟢"
+            extra="CPU $(printf '%3d' "$cpu")% · RAM $(human_bytes "$mem") / $(human_bytes "$maxmem")"
+            if [ "$type" = "lxc" ] && [ "$maxdisk" -gt 0 ]; then
+                extra+=" · диск $(( disk * 100 / maxdisk ))%"
+            fi
+        else
+            if pve_onboot "$vmid" "$type"; then icon="🔴"; else icon="⚪"; fi
+            extra="${C_GRAY}${status}${C_RESET}"
+        fi
+        row "$(printf '%s %-3s %-4s %-14s' "$icon" "$(pve_kind "$type")" "$vmid" "${name:0:14}") ${extra}"
+    done
+    [ "$shown" -eq 0 ] && row "${C_GRAY}гостей нет (или все исключены в конфиге)${C_RESET}"
+
+    local s sname sstatus sused smax
+    for s in "${PVE_STORAGES[@]}"; do
+        IFS='|' read -r sname _ sstatus sused smax <<< "$s"
+        in_list "$sname" "$STORAGE_IGNORE" && continue
+        if [ "$sstatus" != "available" ] || [ "$smax" -le 0 ]; then
+            row "🗄 $(printf '%-12s' "${sname:0:12}") ${C_RED}недоступно${C_RESET}"
+        else
+            row "🗄 $(printf '%-12s' "${sname:0:12}") $(draw_bar $(( sused * 100 / smax )) "$STORAGE_THRESHOLD")  ${C_GRAY}свободно $(human_bytes $(( smax - sused ))) из $(human_bytes "$smax")${C_RESET}"
+        fi
+    done
+
+    local b bvmid bt bs age when
+    for b in "${PVE_BACKUPS[@]}"; do
+        IFS='|' read -r bvmid bt bs <<< "$b"
+        pve_selected "$bvmid" || continue
+        age=$(( (CURRENT_TIME - bt) / 86400 ))
+        when=$(date -d "@${bt}" '+%d.%m.%Y' 2>/dev/null)
+        case "$bs" in
+            OK|WARNINGS*) icon="✅" ;;
+            *) icon="❌" ;;
+        esac
+        row "🗃 Бэкап ${bvmid}: ${when} ${C_GRAY}(${age} дн. назад)${C_RESET} ${icon}"
+    done
+}
+
+render_smart() {
+    [ "${#SMART_DISKS[@]}" -gt 0 ] || return 0
+    section "🩺 Диски (SMART)"
+    local d
+    for d in "${SMART_DISKS[@]}"; do row "$(smart_line "$d")"; done
+}
+
 render_dashboard() {
     local problems=0 i mp color
     [ "$CPU_USAGE" -ge "$CPU_THRESHOLD" ] && problems=$(( problems + 1 ))
@@ -294,7 +612,7 @@ render_dashboard() {
     for i in "${!DISK_USAGES[@]}"; do
         [ "${DISK_USAGES[$i]}" -ge "$DISK_THRESHOLD" ] && problems=$(( problems + 1 ))
     done
-    problems=$(( problems + ${#DOCKER_PROBLEMS[@]} ))
+    problems=$(( problems + ${#DOCKER_PROBLEMS[@]} + ${#EXTRA_KEYS[@]} ))
 
     local status
     if [ "$problems" -eq 0 ]; then
@@ -335,10 +653,26 @@ render_dashboard() {
         row "💾 ${C_YELLOW}${mp} — не найден, проверьте DISKS в конфиге${C_RESET}"
     done
 
-    section "🐳 Docker"
-    if [ "$DOCKER_AVAILABLE" != true ]; then
-        row "${C_GRAY}не установлен или недоступен${C_RESET}"
+    if [ "${#EXTRA_TEXT[@]}" -gt 0 ]; then
+        section "🚨 Внимание"
+        local t
+        for t in "${EXTRA_TEXT[@]}"; do row "${C_RED}${t}${C_RESET}"; done
+    fi
+
+    render_proxmox
+    render_smart
+
+    if [ "$DOCKER" = "off" ] || ! command -v docker >/dev/null 2>&1; then
+        :   # выключен в конфиге или не установлен — раздел не показываем
+    elif [ "$DOCKER_AVAILABLE" != true ]; then
+        section "🐳 Docker"
+        if [ "$(id -u)" -ne 0 ]; then
+            row "${C_GRAY}нет доступа — запустите через sudo${C_RESET}"
+        else
+            row "${C_YELLOW}установлен, но не отвечает (отключить проверку: DOCKER=\"off\")${C_RESET}"
+        fi
     else
+        section "🐳 Docker"
         if [ "${#DOCKER_PROBLEMS[@]}" -eq 0 ]; then
             row "${C_GREEN}✔${C_RESET} Работает ${C_BOLD}${DOCKER_RUNNING}${C_RESET} из ${DOCKER_TOTAL} — проблем нет"
         else
@@ -499,6 +833,22 @@ ${status_line}
 🐳 Docker: работает ${DOCKER_RUNNING} из ${DOCKER_TOTAL}, проблемных: ${#DOCKER_PROBLEMS[@]}"
         fi
     fi
+    report+="$(report_proxmox_html)"
+    if [ "${#SMART_DISKS[@]}" -gt 0 ]; then
+        local d
+        for d in "${SMART_DISKS[@]}"; do
+            report+="
+🩺 $(html_escape "$(smart_line "$d")")"
+        done
+    fi
+    if [ "${#EXTRA_HTML[@]}" -gt 0 ]; then
+        report+="
+
+<b>Требует внимания:</b>"
+        local x
+        for x in "${EXTRA_HTML[@]}"; do report+="
+${x}"; done
+    fi
 
     if [ "$PERIOD_CHECKS" -gt 0 ]; then
         peaks="⚡ CPU до <code>${PEAK_CPU}%</code> · 🧠 RAM до <code>${PEAK_RAM}%</code>"
@@ -520,6 +870,48 @@ ${status_line}
 🏆 <b>Топ процессов по памяти:</b>
 $(top_processes_html)"
     printf '%s' "$report"
+}
+
+report_proxmox_html() {
+    [ "$PVE_AVAILABLE" = true ] || return 0
+    local out="" g vmid type name status cpu mem maxmem disk maxdisk icon
+    out+="
+
+🖥 <b>Proxmox:</b>"
+    for g in "${PVE_GUESTS[@]}"; do
+        IFS='|' read -r vmid type name status cpu mem maxmem disk maxdisk <<< "$g"
+        pve_selected "$vmid" || continue
+        if [ "$status" = "running" ]; then
+            out+="
+🟢 $(pve_kind "$type") ${vmid} <b>$(html_escape "$name")</b> — CPU ${cpu}% · RAM $(human_bytes "$mem") из $(human_bytes "$maxmem")"
+            [ "$type" = "lxc" ] && [ "$maxdisk" -gt 0 ] && out+=" · диск $(( disk * 100 / maxdisk ))%"
+        else
+            if pve_onboot "$vmid" "$type"; then icon="🔴"; else icon="⚪"; fi
+            out+="
+${icon} $(pve_kind "$type") ${vmid} <b>$(html_escape "$name")</b> — ${status}"
+        fi
+    done
+    local s sname sstatus sused smax
+    for s in "${PVE_STORAGES[@]}"; do
+        IFS='|' read -r sname _ sstatus sused smax <<< "$s"
+        in_list "$sname" "$STORAGE_IGNORE" && continue
+        if [ "$sstatus" != "available" ] || [ "$smax" -le 0 ]; then
+            out+="
+🗄 $(html_escape "$sname") — <b>недоступно</b>"
+        else
+            out+="
+🗄 $(html_escape "$sname") <code>$(( sused * 100 / smax ))%</code> — свободно $(human_bytes $(( smax - sused ))) из $(human_bytes "$smax")"
+        fi
+    done
+    local b bvmid bt bs ok
+    for b in "${PVE_BACKUPS[@]}"; do
+        IFS='|' read -r bvmid bt bs <<< "$b"
+        pve_selected "$bvmid" || continue
+        case "$bs" in OK|WARNINGS*) ok="✅" ;; *) ok="❌" ;; esac
+        out+="
+🗃 Бэкап ${bvmid}: $(date -d "@${bt}" '+%d.%m.%Y' 2>/dev/null) ($(( (CURRENT_TIME - bt) / 86400 )) дн. назад) ${ok}"
+    done
+    printf '%s' "$out"
 }
 
 reset_period() {
@@ -589,6 +981,9 @@ run_check() {
         name=${p%%|*}
         keys+=("docker:${name}")
         lines+=("🐳 <b>Docker</b> <code>$(html_escape "$name")</code> — $(html_escape "${p#*|}")")
+    done
+    for i in "${!EXTRA_KEYS[@]}"; do
+        keys+=("${EXTRA_KEYS[$i]}"); lines+=("${EXTRA_HTML[$i]}")
     done
 
     local reasons_key=""
