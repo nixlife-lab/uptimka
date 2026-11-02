@@ -212,8 +212,13 @@ if [ -n "$SRC_DIR" ] && [ -f "${SRC_DIR}/uptimka.sh" ] && [ "${BASH_SOURCE[0]:-}
     info "Ставлю uptimka.sh из локальной папки ${SRC_DIR}"
     cp "${SRC_DIR}/uptimka.sh" "$TMP_SCRIPT"
 else
-    curl -fsSL --max-time 30 "${REPO_RAW}/uptimka.sh" -o "$TMP_SCRIPT" \
-        || die "Не удалось скачать ${REPO_RAW}/uptimka.sh"
+    if ! curl -fsSL --max-time 30 "${REPO_RAW}/uptimka.sh" -o "$TMP_SCRIPT"; then
+        [ "$UPTIMKA_REF" = "main" ] && die "Не удалось скачать ${REPO_RAW}/uptimka.sh"
+        warn "Версия ${UPTIMKA_REF} не найдена, ставлю последнюю из ветки main"
+        REPO_RAW="https://raw.githubusercontent.com/nixlife-lab/uptimka/main"
+        curl -fsSL --max-time 30 "${REPO_RAW}/uptimka.sh" -o "$TMP_SCRIPT" \
+            || die "Не удалось скачать ${REPO_RAW}/uptimka.sh"
+    fi
 fi
 
 # Проверяем, что скачался именно скрипт, а не страница ошибки
