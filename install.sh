@@ -196,17 +196,25 @@ if [ "$KEEP_CONFIG" = false ]; then
     while true; do
         PROXY_ARGS=()
         [ -n "$USER_TG_PROXY" ] && PROXY_ARGS=(--proxy "$USER_TG_PROXY")
-        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "${PROXY_ARGS[@]}" \
+        TG_RESPONSE=$(mktemp)
+        HTTP_STATUS=$(curl -s -o "$TG_RESPONSE" -w "%{http_code}" --max-time 15 "${PROXY_ARGS[@]}" \
             -X POST "https://api.telegram.org/bot${USER_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${USER_CHAT_ID}" \
             --data-urlencode "text=${TEST_MSG}" \
             -d "parse_mode=HTML" || true)
+        TG_DESC=$(grep -o '"description":"[^"]*"' "$TG_RESPONSE" 2>/dev/null | cut -d'"' -f4 || true)
+        rm -f "$TG_RESPONSE"
         [ "$HTTP_STATUS" = "200" ] && break
 
         echo "❌ Тестовое сообщение не отправилось (HTTP ${HTTP_STATUS:-нет ответа})."
+        [ -n "$TG_DESC" ] && echo "   Ответ Telegram: ${TG_DESC}"
         case "$HTTP_STATUS" in
             401|404) echo "   Неверный Bot Token."; exit 1 ;;
-            400|403) echo "   Неверный Chat ID, или вы не написали боту /start (в группе — бот не добавлен)."; exit 1 ;;
+            400|403)
+                echo "   Проверьте Chat ID и напишите своему боту /start (в группе/канале бот должен быть участником)."
+                echo "   Узнать свой Chat ID: напишите боту что-нибудь и откройте"
+                echo "   https://api.telegram.org/bot<ТОКЕН>/getUpdates — число в \"chat\":{\"id\": ...}"
+                exit 1 ;;
             000|"")
                 echo "   Нет связи с api.telegram.org — сервер не может достучаться до Telegram."
                 echo "   Если Telegram у провайдера недоступен, можно отправлять через прокси,"
