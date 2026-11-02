@@ -3,8 +3,8 @@
 set -e
 
 INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/nix-monitor"
-SCRIPT_NAME="nix-monitor"
+CONFIG_DIR="/etc/uptimka"
+SCRIPT_NAME="uptimka"
 
 if [ "$EUID" -ne 0 ]; then
     echo "❌ Пожалуйста, запустите установщик с правами root (через sudo)."
@@ -12,31 +12,32 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "==============================================="
-echo "   Добро пожаловать в установщик nix-monitor   "
+echo "   Добро пожаловать в установщик uptimka   "
 echo "==============================================="
 echo ""
 
-read -rp "Введите Telegram Bot Token: " USER_TOKEN
-read -rp "Введите Telegram Chat ID: " USER_CHAT_ID
+read -rp "Введите Telegram Bot Token: " USER_TOKEN < /dev/tty
+read -rp "Введите Telegram Chat ID: " USER_CHAT_ID < /dev/tty
 
-read -rp "Порог срабатывания CPU в % [по умолчанию: 85]: " USER_CPU
+read -rp "Порог срабатывания CPU в % [по умолчанию: 85]: " USER_CPU < /dev/tty
 USER_CPU=${USER_CPU:-85}
 
-read -rp "Порог срабатывания RAM в % [по умолчанию: 90]: " USER_RAM
+read -rp "Порог срабатывания RAM в % [по умолчанию: 90]: " USER_RAM < /dev/tty
 USER_RAM=${USER_RAM:-90}
 
-read -rp "Порог заполнения диска в % [по умолчанию: 90]: " USER_DISK
+read -rp "Порог заполнения диска в % [по умолчанию: 90]: " USER_DISK < /dev/tty
 USER_DISK=${USER_DISK:-90}
 
-read -rp "Интервал проверки в минутах [по умолчанию: 5]: " USER_INTERVAL
+read -rp "Интервал проверки в минутах [по умолчанию: 5]: " USER_INTERVAL < /dev/tty
 USER_INTERVAL=${USER_INTERVAL:-5}
 
 echo ""
 echo "⏳ Проверка связи с Telegram..."
-TEST_MSG="✅ <b>nix-monitor успешно установлен!</b>%0A🖥 Хост: <code>$(hostname)</code>"
+TEST_MSG="✅ <b>uptimka успешно установлен!</b>
+🖥 Хост: <code>$(hostname)</code>"
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.telegram.org/bot${USER_TOKEN}/sendMessage" \
-    -d "chat_id=${USER_CHAT_ID}" \
-    -d "text=${TEST_MSG}" \
+    --data-urlencode "chat_id=${USER_CHAT_ID}" \
+    --data-urlencode "text=${TEST_MSG}" \
     -d "parse_mode=HTML")
 
 if [ "$HTTP_STATUS" -ne 200 ]; then
@@ -48,8 +49,8 @@ fi
 echo "✅ Тестовое уведомление успешно доставлено в Telegram!"
 
 mkdir -p "$CONFIG_DIR"
-cat <<EOF > "${CONFIG_DIR}/nix-monitor.conf"
-# Конфигурация nix-monitor
+cat <<EOF > "${CONFIG_DIR}/uptimka.conf"
+# Конфигурация uptimka
 BOT_TOKEN="${USER_TOKEN}"
 CHAT_ID="${USER_CHAT_ID}"
 
@@ -60,9 +61,9 @@ ALERT_COOLDOWN=3600
 SEND_RESOLVE_ALERT=true
 EOF
 
-chmod 600 "${CONFIG_DIR}/nix-monitor.conf"
+chmod 600 "${CONFIG_DIR}/uptimka.conf"
 
-curl -sSL "https://raw.githubusercontent.com/Flyerrs/nix-monitor/main/nix-monitor.sh" -o "${INSTALL_DIR}/${SCRIPT_NAME}"
+curl -sSL "https://raw.githubusercontent.com/nixlife-lab/uptimka/main/uptimka.sh" -o "${INSTALL_DIR}/${SCRIPT_NAME}"
 chmod +x "${INSTALL_DIR}/${SCRIPT_NAME}"
 
 CRON_JOB="*/${USER_INTERVAL} * * * * ${INSTALL_DIR}/${SCRIPT_NAME} --cron > /dev/null 2>&1"
@@ -71,7 +72,7 @@ CRON_JOB="*/${USER_INTERVAL} * * * * ${INSTALL_DIR}/${SCRIPT_NAME} --cron > /dev
 echo ""
 echo "==============================================="
 echo "🎉 Установка завершена успешно!"
-echo "📁 Конфиг: ${CONFIG_DIR}/nix-monitor.conf"
+echo "📁 Конфиг: ${CONFIG_DIR}/uptimka.conf"
 echo "⚙️ Скрипт: ${INSTALL_DIR}/${SCRIPT_NAME}"
 echo "⏱ Проверка каждые ${USER_INTERVAL} мин через Cron"
 echo "==============================================="

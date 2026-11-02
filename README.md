@@ -1,4 +1,4 @@
-# 🐧 nix-monitor
+# 🐧 uptimka
 
 <div align="center">
 
@@ -15,11 +15,11 @@
 
 ---
 
-## ⚡️ Почему nix-monitor?
+## ⚡️ Почему uptimka?
 
 Большинство систем мониторинга избыточны для одиночных VPS или домашних серверов: они потребляют от сотен мегабайт RAM и требуют сложной настройки.
 
-**nix-monitor** решает задачу иначе:
+**uptimka** решает задачу иначе:
 - 🪶 **0 МБ постоянной памяти:** запускается по cron, отрабатывает за доли секунды и полностью выгружается.
 - 🚫 **Zero Dependencies:** использует только штатные интерфейсы ядра (`/proc/stat`, `/sys/class/thermal`, `awk`, `curl`, `df`, `free`).
 - 🛡 **Умный антиспам (Alert Cooldown):** если нагрузка держится долго, повторный алерт придет только через заданный интервал (по умолчанию 60 минут).
@@ -34,7 +34,7 @@
 Запустите утилиту без аргументов в терминале для быстрой оценки состояния сервера:
 
 ```text
-======================= nix-monitor =======================
+======================= uptimka =======================
   Хост:          vps-node-01
   Аптайм:        28 days, 14 hours
   Темп. CPU:     43°C (Load: 0.18, 0.22, 0.15)
@@ -94,14 +94,14 @@
 Запустите установщик одной командой:
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/Flyerrs/nix-monitor/main/install.sh](https://raw.githubusercontent.com/Flyerrs/nix-monitor/main/install.sh) | sudo bash
+curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh | sudo bash
 ```
 
 Установщик запросит `Bot Token` и `Chat ID`, проверит отправку тестового сообщения и добавит задачу проверки в `cron`.
 
 ---
 
-## ⚙️ Конфигурация (`/etc/nix-monitor/nix-monitor.conf`)
+## ⚙️ Конфигурация (`/etc/uptimka/uptimka.conf`)
 
 ```bash
 # Telegram Bot Credentials
@@ -126,19 +126,19 @@ SEND_RESOLVE_ALERT=true
 
 | Команда | Описание |
 | :--- | :--- |
-| `nix-monitor` | Вывести аккуратный TUI-дашборд с текущими показателями |
-| `nix-monitor -w` | Запустить живой режим с автообновлением каждые 2 секунды |
-| `nix-monitor --cron` | Фоновый запуск для планировщика cron |
+| `uptimka` | Вывести аккуратный TUI-дашборд с текущими показателями |
+| `uptimka -w` | Запустить живой режим с автообновлением каждые 2 секунды |
+| `uptimka --cron` | Фоновый запуск для планировщика cron |
 
 ---
 
 ## 🗑 Удаление
 
 ```bash
-sudo rm -f /usr/local/bin/nix-monitor
-sudo rm -rf /etc/nix-monitor
-sudo rm -f /var/run/nix-monitor.state
-crontab -l | grep -v 'nix-monitor' | crontab -
+sudo rm -f /usr/local/bin/uptimka
+sudo rm -rf /etc/uptimka
+sudo rm -f /var/run/uptimka.state
+crontab -l | grep -v 'uptimka' | crontab -
 ```
 
 ---

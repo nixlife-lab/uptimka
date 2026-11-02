@@ -2,18 +2,19 @@
 
 set -eo pipefail
 
-CONFIG_FILE="/etc/nix-monitor/nix-monitor.conf"
-STATE_FILE="/var/run/nix-monitor.state"
+CONFIG_FILE="/etc/uptimka/uptimka.conf"
+STATE_FILE="/var/run/uptimka.state"
 
-# ANSI-цвета
-C_RESET="\033[0m"
-C_BOLD="\033[1m"
-C_BLUE="\033[1;34m"
-C_CYAN="\033[36m"
-C_GREEN="\033[32m"
-C_YELLOW="\033[33m"
-C_RED="\033[31m"
-C_GRAY="\033[90m"
+# ANSI-цвета: $'…' даёт настоящий символ ESC, поэтому цвет работает и в printf %s (раньше в строках
+# «Хост» и «Load» печаталось буквально \033[1m)
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_BLUE=$'\033[1;34m'
+C_CYAN=$'\033[36m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_RED=$'\033[31m'
+C_GRAY=$'\033[90m'
 
 # Чтение конфига
 if [ -f "$CONFIG_FILE" ]; then
@@ -78,7 +79,8 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         if [ -n "$line" ]; then
             FAILED_CONTAINERS+=("$line")
         fi
-    done < <(docker ps -a --filter "status=exited" --format '{{.Names}} (Exit {{.State}})' | grep -v '(Exit exited (0))' || true)
+    done < <(docker ps -a --filter "status=exited" --format '{{.Names}}|{{.Status}}' \
+        | awk -F'|' 'match($2, /\(-?[0-9]+\)/) { code = substr($2, RSTART + 1, RLENGTH - 2); if (code != "0") print $1 " (Exit " code ")" }' || true)
 fi
 
 # ==========================================================
@@ -109,7 +111,7 @@ draw_bar() {
 render_dashboard() {
     clear
     echo -e "${C_BLUE}┌────────────────────────────────────────────────────────┐${C_RESET}"
-    echo -e "${C_BLUE}│${C_BOLD}${C_CYAN}  🐧 nix-monitor :: Панель управления сервером        ${C_BLUE}│${C_RESET}"
+    echo -e "${C_BLUE}│${C_BOLD}${C_CYAN}  🐧 uptimka :: Панель управления сервером        ${C_BLUE}│${C_RESET}"
     echo -e "${C_BLUE}├────────────────────────────────────────────────────────┤${C_RESET}"
     printf "${C_BLUE}│${C_RESET}  %-14s %-39s ${C_BLUE}│${C_RESET}\n" "🖥  Хост:" "${C_BOLD}${HOSTNAME}${C_RESET}"
     printf "${C_BLUE}│${C_RESET}  %-14s %-39s ${C_BLUE}│${C_RESET}\n" "⏱  Аптайм:" "${UPTIME_STR}"
@@ -200,10 +202,10 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 send_telegram() {
-    local text="$1"
+    local text="${1//%0A/$'\n'}"
     curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${CHAT_ID}" \
-        -d "text=${text}" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${text}" \
         -d "parse_mode=HTML" > /dev/null 2>&1 || true
 }
 
