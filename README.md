@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.3.0-orange?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.3.1-orange?style=flat-square)
 ![Bash](https://img.shields.io/badge/bash-4.4+-4EAA25?style=flat-square&logo=gnu-bash&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Docker](https://img.shields.io/badge/docker-compatible-2496ED?style=flat-square&logo=docker&logoColor=white)
@@ -165,7 +165,7 @@ curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh 
 3. отправит тестовое сообщение — и подскажет, что не так, если оно не дошло;
 4. поставит проверку по расписанию: **systemd-таймер**, а если systemd нет — **cron**.
 
-Ставится закреплённая версия (`v1.3.0`). Самую свежую из ветки `main` можно поставить так:
+Ставится закреплённая версия (`v1.3.1`). Самую свежую из ветки `main` можно поставить так:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh | sudo UPTIMKA_REF=main bash
@@ -181,6 +181,40 @@ curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh 
 3. Узнайте свой Chat ID, например через [@userinfobot](https://t.me/userinfobot). Для группы добавьте бота в неё — ID группы начинается с `-100`.
 
 </details>
+
+---
+
+### 🌐 Если Telegram с сервера недоступен
+
+Установщик сообщит «Нет связи с api.telegram.org» и предложит указать прокси. Самый простой вариант, если есть свой VPS за рубежом, — SSH-туннель: на VPS ничего ставить и открывать не нужно.
+
+```bash
+# 1. Ключ для входа на VPS без пароля (если ещё нет)
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+ssh-copy-id root@IP_VPS
+
+# 2. Туннель как служба: SOCKS5 на 127.0.0.1:1080 через VPS
+cat > /etc/systemd/system/tg-tunnel.service <<'EOF'
+[Unit]
+Description=SSH-туннель до VPS для Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -D 127.0.0.1:1080 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes root@IP_VPS
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now tg-tunnel
+
+# 3. Проверка
+curl -s --proxy socks5h://127.0.0.1:1080 https://api.telegram.org | head -c 100
+```
+
+Дальше на вопрос установщика о прокси ответьте `socks5h://127.0.0.1:1080` (или задайте `TG_PROXY` в конфиге).
 
 ---
 
@@ -267,6 +301,9 @@ curl -sSL https://raw.githubusercontent.com/nixlife-lab/uptimka/main/install.sh 
 ---
 
 ## 📝 Что нового
+
+**1.3.1**
+- 🌐 Отправка в Telegram через прокси (`TG_PROXY`) или свой адрес Bot API (`TG_API_URL`); установщик предлагает прокси, если api.telegram.org недоступен.
 
 **1.3.0**
 - 🖥 Мониторинг Proxmox VE: VM и LXC (все или выбранные), хранилища, бэкапы — в дашборде, алертах и отчётах.

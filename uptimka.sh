@@ -4,7 +4,7 @@
 
 set -o pipefail
 
-UPTIMKA_VERSION="1.3.0"
+UPTIMKA_VERSION="1.3.1"
 
 # cron запускает задачи с урезанным PATH — добавляем стандартные пути (и snap, где бывает Docker)
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH}"
@@ -31,6 +31,8 @@ fi
 # ==========================================================
 BOT_TOKEN=""
 CHAT_ID=""
+TG_PROXY=""               # прокси для Telegram: socks5h://IP:порт или http://IP:порт
+TG_API_URL="https://api.telegram.org"   # свой адрес Bot API (например, reverse-proxy на VPS)
 CPU_THRESHOLD=85
 RAM_THRESHOLD=90
 DISK_THRESHOLD=90
@@ -708,9 +710,11 @@ send_telegram() {
         echo "uptimka: BOT_TOKEN/CHAT_ID не заданы в ${CONFIG_FILE}" >&2
         return 1
     fi
-    local code
+    local code proxy_args=()
+    [ -n "$TG_PROXY" ] && proxy_args=(--proxy "$TG_PROXY")
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 --retry 2 --retry-delay 3 \
-        -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        "${proxy_args[@]}" \
+        -X POST "${TG_API_URL%/}/bot${BOT_TOKEN}/sendMessage" \
         --data-urlencode "chat_id=${CHAT_ID}" \
         --data-urlencode "text=$1" \
         -d "parse_mode=HTML" -d "disable_web_page_preview=true" 2>/dev/null)

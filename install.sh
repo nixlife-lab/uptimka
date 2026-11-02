@@ -5,7 +5,7 @@
 
 set -eo pipefail
 
-UPTIMKA_REF="${UPTIMKA_REF:-v1.3.0}"   # какую версию ставить (тег релиза; UPTIMKA_REF=main — самая свежая)
+UPTIMKA_REF="${UPTIMKA_REF:-v1.3.1}"   # какую версию ставить (тег релиза; UPTIMKA_REF=main — самая свежая)
 REPO_RAW="https://raw.githubusercontent.com/nixlife-lab/uptimka/${UPTIMKA_REF}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/uptimka"
@@ -192,21 +192,37 @@ if [ "$KEEP_CONFIG" = false ]; then
     TEST_MSG="✅ <b>uptimka установлен!</b>
 💻 Хост: <code>$(hostname)</code>
 Уведомления будут приходить сюда 👍"
-    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
-        -X POST "https://api.telegram.org/bot${USER_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${USER_CHAT_ID}" \
-        --data-urlencode "text=${TEST_MSG}" \
-        -d "parse_mode=HTML" || true)
+    USER_TG_PROXY="${UPTIMKA_TG_PROXY:-}"
+    while true; do
+        PROXY_ARGS=()
+        [ -n "$USER_TG_PROXY" ] && PROXY_ARGS=(--proxy "$USER_TG_PROXY")
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "${PROXY_ARGS[@]}" \
+            -X POST "https://api.telegram.org/bot${USER_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${USER_CHAT_ID}" \
+            --data-urlencode "text=${TEST_MSG}" \
+            -d "parse_mode=HTML" || true)
+        [ "$HTTP_STATUS" = "200" ] && break
 
-    if [ "$HTTP_STATUS" != "200" ]; then
         echo "❌ Тестовое сообщение не отправилось (HTTP ${HTTP_STATUS:-нет ответа})."
         case "$HTTP_STATUS" in
-            401|404) echo "   Неверный Bot Token." ;;
-            400|403) echo "   Неверный Chat ID, или вы не написали боту /start (в группе — бот не добавлен)." ;;
-            000|"")  echo "   Нет связи с api.telegram.org — проверьте интернет/фаервол сервера." ;;
+            401|404) echo "   Неверный Bot Token."; exit 1 ;;
+            400|403) echo "   Неверный Chat ID, или вы не написали боту /start (в группе — бот не добавлен)."; exit 1 ;;
+            000|"")
+                echo "   Нет связи с api.telegram.org — сервер не может достучаться до Telegram."
+                echo "   Если Telegram у провайдера недоступен, можно отправлять через прокси,"
+                echo "   например SOCKS5 на своём VPS: socks5h://IP:порт (или http://IP:порт)."
+                ask "Прокси для Telegram (Enter — прервать установку)" ""
+                [ -z "$REPLY" ] && exit 1
+                if [[ ! "$REPLY" =~ ^(socks5h?|socks4a?|https?)://[^[:space:]]+$ ]]; then
+                    warn "Адрес прокси начинается с socks5h:// или http://"
+                    continue
+                fi
+                USER_TG_PROXY=$REPLY
+                echo "⏳ Пробую через прокси..."
+                ;;
+            *) exit 1 ;;
         esac
-        exit 1
-    fi
+    done
     ok "Тестовое сообщение доставлено в Telegram"
 
     mkdir -p "$CONFIG_DIR"
@@ -237,6 +253,9 @@ NOTIFY_REBOOT=true
 
 # Docker-контейнеры, которые не нужно проверять (имена через пробел)
 DOCKER_IGNORE=""
+
+# Прокси для Telegram, если api.telegram.org недоступен напрямую (socks5h://IP:порт или http://IP:порт)
+TG_PROXY="${USER_TG_PROXY}"
 EOF
 fi
 
